@@ -1,0 +1,58 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const node_test_1 = require("node:test");
+const strict_1 = __importDefault(require("node:assert/strict"));
+const pg_mem_1 = require("pg-mem");
+const node_fs_1 = require("node:fs");
+const bcryptjs_1 = require("bcryptjs");
+const pg_1 = __importDefault(require("pg"));
+(0, node_test_1.test)('Authenticated lead lifecycle, validation, conflict and history', async () => {
+    process.env.JWT_SECRET = 'test-only-secret-value-with-more-than-32-characters';
+    process.env.DATABASE_URL = 'postgresql://test:test@localhost/test';
+    process.env.PORT = '0';
+    const db = (0, pg_mem_1.newDb)();
+    db.public.none((0, node_fs_1.readFileSync)('sql/001-init.sql', 'utf8'));
+    const adapter = db.adapters.createPg();
+    pg_1.default.Pool = adapter.Pool;
+    const { pool } = require('./database');
+    await pool.query('INSERT INTO users(username,name,role,password_hash) VALUES($1,$2,$3,$4)', ['admin', 'Admin', 'admin', await (0, bcryptjs_1.hash)('test-password', 4)]);
+    const { start } = require('./main');
+    const app = await start();
+    const address = app.getHttpServer().address();
+    const base = `http://127.0.0.1:${address.port}/api`;
+    let token = '';
+    async function req(path, method = 'GET', body) { const r = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined }); return { status: r.status, data: await r.json() }; }
+    try {
+        strict_1.default.equal((await req('/leads')).status, 401);
+        strict_1.default.equal((await req('/auth/login', 'POST', { username: 'admin', password: 'bad' })).status, 401);
+        const auth = await req('/auth/login', 'POST', { username: 'admin', password: 'test-password' });
+        strict_1.default.equal(auth.status, 201);
+        token = auth.data.token;
+        const d = { fullName: 'Test Mijoz', industry: 'Logistika', region: 'Toshkent shahri', city: 'Yashnobod', customerType: 'legal', products: [{ id: 'uat-1', name: 'JAC X200' }], paymentType: 'leasing', offerSent: 'no', phone: '+998901234567', source: 'phone', operatorId: 1 };
+        strict_1.default.equal((await req('/leads', 'POST', { ...d, products: [] })).status, 400);
+        strict_1.default.equal((await req('/leads', 'POST', { ...d, operatorId: 999 })).status, 400);
+        const created = await req('/leads', 'POST', d);
+        strict_1.default.equal(created.status, 201);
+        const id = created.data.id;
+        strict_1.default.equal(created.data.version, 1);
+        strict_1.default.equal((await req('/leads')).data.length, 1);
+        const update = await req('/leads/' + id, 'PUT', { ...d, status: 'won', amount: 1000000, version: 1 });
+        strict_1.default.equal(update.status, 200);
+        strict_1.default.equal(update.data.version, 2);
+        strict_1.default.equal((await req('/leads/' + id, 'PUT', { ...d, status: 'contacted', version: 1 })).status, 409);
+        strict_1.default.equal((await req('/leads/' + id, 'PUT', { ...d, status: 'lost', version: 2 })).status, 400);
+        const lost = await req('/leads/' + id, 'PUT', { ...d, status: 'lost', rejectionReason: 'expensive', version: 2 });
+        strict_1.default.equal(lost.status, 200);
+        const events = await req('/leads/' + id + '/events');
+        strict_1.default.equal(events.data.length, 3);
+        strict_1.default.match(events.data[0].description, /won → lost/);
+        strict_1.default.equal((await req('/leads')).data[0].status, 'lost');
+    }
+    finally {
+        await app.close();
+        await pool.end();
+    }
+});
