@@ -1,0 +1,53 @@
+name: Diagnose cPanel startup
+on:
+  push:
+    paths: ['.github/workflows/diagnose.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Read startup error categories without exposing logs or secrets
+        env:
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_SERVER_DIR: ${{ vars.FTP_SERVER_DIR }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from ftplib import FTP
+          with FTP(os.environ['FTP_SERVER'], timeout=30) as ftp:
+              ftp.login(os.environ['FTP_USERNAME'], os.environ['FTP_PASSWORD'])
+              ftp.cwd(os.environ['FTP_SERVER_DIR'])
+              names = {n.rsplit('/',1)[-1] for n in ftp.nlst()}
+              for name in ['app.js','package.json','.env','node_modules','stderr.log']:
+                  print(name + ' present: ' + str(name in names))
+              if 'stderr.log' in names:
+                  tail = bytearray()
+                  def collect(chunk):
+                      tail.extend(chunk)
+                      if len(tail)>65536: del tail[:-65536]
+                  ftp.retrbinary('RETR stderr.log',collect)
+                  log=tail.decode('utf-8',errors='replace')
+                  patterns = [
+                      r"Cannot find module '[A-Za-z0-9@_./-]+'",
+                      r'JWT_SECRET must contain at least 32 random characters',
+                      r'DATABASE_URL is required',
+                      r'Set explicit FRONTEND_ORIGIN values in production',
+                      r'Production FRONTEND_ORIGIN must use HTTPS',
+                      r'Invalid PORT',r'Invalid TRUST_PROXY_HOPS',
+                      r'ECONNREFUSED',r'ENOTFOUND',r'EAI_AGAIN',
+                      r'password authentication failed',r'no pg_hba.conf entry',
+                      r'certificate verify failed',r'self-signed certificate',
+                      r'SyntaxError',r'TypeError',r'EADDRINUSE',
+                  ]
+                  matches=[]
+                  for pattern in patterns:
+                      for match in re.finditer(pattern,log): matches.append((match.start(),match.group()))
+                  for _,message in sorted(matches)[-15:]: print('Detected: '+message)
+                  if not matches: print('No recognized error category; server log review needed')
+          PY
