@@ -1,8 +1,7 @@
-"""Upload only runtime files using explicit TLS. Never delete remote files."""
+"""Upload only runtime files using FTP. Never delete remote files."""
 import io
 import os
-import ssl
-from ftplib import FTP_TLS, error_perm
+from ftplib import FTP, error_perm
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -24,10 +23,9 @@ def deploy():
     for file in files:
         if not file.is_file():
             raise SystemExit('Missing runtime file: ' + str(file))
-    with FTP_TLS(context=ssl.create_default_context(), timeout=60) as ftp:
+    with FTP(timeout=60) as ftp:
         ftp.connect(os.environ['FTP_SERVER'], int(os.environ.get('FTP_PORT') or 21))
         ftp.login(os.environ['FTP_USERNAME'], os.environ['FTP_PASSWORD'])
-        ftp.prot_p()
         ftp.cwd(target)
         if target == '/':
             names = {name.rsplit('/', 1)[-1] for name in ftp.nlst()}
