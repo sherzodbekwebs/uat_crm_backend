@@ -2,6 +2,7 @@ name: Test and deploy backend
 on:
   push:
     branches: [main]
+    paths-ignore: ['.github/workflows/diagnose.yml', 'DEPLOY.md']
   pull_request:
   workflow_dispatch:
 permissions:
