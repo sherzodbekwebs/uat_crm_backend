@@ -1,0 +1,53 @@
+name: Test and deploy backend
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - name: Prepare runtime files
+        run: |
+          mkdir -p release/dist release/sql
+          cp app.js package.json package-lock.json release/
+          cp dist/main.js dist/database.js dist/validation.js release/dist/
+          cp sql/001-init.sql release/sql/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-runtime
+          path: release/
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.CPANEL_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-runtime
+          path: release/
+      - name: Upload runtime and restart Passenger
+        env:
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_SERVER_DIR: ${{ vars.FTP_SERVER_DIR }}
+          FTP_PORT: ${{ vars.FTP_PORT }}
+        run: python3 scripts/deploy-ftps.py
+      - name: Verify API
+        run: curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 5 --max-time 30 https://crm-api.uzautotrailer.uz/api/health
