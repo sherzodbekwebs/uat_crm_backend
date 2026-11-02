@@ -18,7 +18,7 @@ jobs:
           FTP_SERVER_DIR: ${{ vars.FTP_SERVER_DIR }}
         run: |
           python3 - <<'PY'
-          import os, re
+          import os, re, json
           from ftplib import FTP
           with FTP(os.environ['FTP_SERVER'], timeout=30) as ftp:
               ftp.login(os.environ['FTP_USERNAME'], os.environ['FTP_PASSWORD'])
@@ -26,6 +26,13 @@ jobs:
               names = {n.rsplit('/',1)[-1] for n in ftp.nlst()}
               for name in ['app.js','package.json','.env','node_modules','stderr.log']:
                   print(name + ' present: ' + str(name in names))
+              if 'startup-status.json' in names:
+                  data=bytearray()
+                  ftp.retrbinary('RETR startup-status.json', data.extend)
+                  status=json.loads(data)
+                  for key in ('stage','reason','code','time'):
+                      value=str(status.get(key,''))
+                      if re.fullmatch(r'[A-Za-z0-9_ .:+-]{0,100}',value): print('STARTUP '+key+': '+value)
               if 'stderr.log' in names:
                   tail = bytearray()
                   def collect(chunk):
