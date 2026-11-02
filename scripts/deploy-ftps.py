@@ -13,7 +13,7 @@ def deploy():
     if missing:
         raise SystemExit('Missing deployment settings: ' + ', '.join(missing))
     target = os.environ['FTP_SERVER_DIR']
-    if target.strip() in ('', '/', '.', './') or '..' in target.split('/'):
+    if target.strip() in ('', '.', './') or '..' in target.split('/'):
         raise SystemExit('FTP_SERVER_DIR must name a dedicated application directory')
     root = Path('release')
     files = [root / name for name in (
@@ -29,6 +29,10 @@ def deploy():
         ftp.login(os.environ['FTP_USERNAME'], os.environ['FTP_PASSWORD'])
         ftp.prot_p()
         ftp.cwd(target)
+        if target == '/':
+            names = {name.rsplit('/', 1)[-1] for name in ftp.nlst()}
+            if not {'app.js', 'package.json'}.issubset(names):
+                raise SystemExit('FTP root must be the existing backend application directory')
         for directory in ('dist', 'sql', 'tmp'):
             try:
                 ftp.mkd(directory)
