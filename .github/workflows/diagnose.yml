@@ -1,4 +1,5 @@
 name: Diagnose cPanel startup
+# Inspect the deployed startup marker.
 on:
   push:
     paths: ['.github/workflows/diagnose.yml']
