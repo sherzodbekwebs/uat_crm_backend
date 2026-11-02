@@ -10,7 +10,10 @@ berilmasligini, login takrorlanishini, parol va rol yangilanishini tekshiradi.
 
 ## Bir marta sozlash
 
-1. cPanel Node.js ilovasida Node 22 va startup file `app.js` ni tanlang.
+Application root: `uat-crm-backend` (foydalanuvchi tasdiqlagan).
+FTP orqali ko‘rinadigan yo‘l hali tasdiqlanmagan.
+
+1. cPanel Node.js ilovasida Node 24.22.1 va startup file `app.js` ni tanlang.
    Mavjud production bazasi va `.env` sozlamalarini saqlang.
 2. Ilova papkasida `npm ci --omit=dev` bajaring (yoki cPanel Run NPM Install).
    FTP buyruq bajarmaydi: dependency o‘zgargan deploylarda bu qadam yana kerak.
