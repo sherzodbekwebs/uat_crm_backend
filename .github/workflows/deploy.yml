@@ -33,7 +33,7 @@ jobs:
           path: release/
   deploy:
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.CPANEL_DEPLOY_ENABLED == 'true'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.CPANEL_DEPLOY_ENABLED != 'false'
     runs-on: ubuntu-latest
     environment: production
     steps:
