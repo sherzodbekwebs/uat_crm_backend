@@ -11,7 +11,7 @@ berilmasligini, login takrorlanishini, parol va rol yangilanishini tekshiradi.
 ## Bir marta sozlash
 
 Application root: `uat-crm-backend` (foydalanuvchi tasdiqlagan).
-FTP orqali ko‘rinadigan yo‘l hali tasdiqlanmagan.
+FTP hisobi ilova papkasiga cheklangan: FTP_SERVER_DIR=/, FTP_PORT=21.
 
 1. cPanel Node.js ilovasida Node 24.22.1 va startup file `app.js` ni tanlang.
    Mavjud production bazasi va `.env` sozlamalarini saqlang.
@@ -23,11 +23,11 @@ FTP orqali ko‘rinadigan yo‘l hali tasdiqlanmagan.
 4. Variables: `FTP_SERVER_DIR` — FTP orqali ko‘rinadigan aniq ilova papkasi
    (masalan `/crm-backend/`; cPanel absolute path bilan bir xil bo‘lishi shart emas),
    `FTP_PORT` — odatda `21`.
-5. Server explicit FTPS va haqiqiy TLS sertifikatini qo‘llashi kerak.
-6. Papka va dependencies tekshirilgach `CPANEL_DEPLOY_ENABLED=true` qo‘ying.
+5. Foydalanuvchi tanloviga ko‘ra oddiy FTP ishlatiladi (TLS yo‘q).
+6. Deploy yoqilgan. To‘xtatish uchun `CPANEL_DEPLOY_ENABLED=false` qo‘ying.
 
 `main` ga push → npm test/build → runtime upload → Passenger restart → health check.
-Secrets tayyor bo‘lmaguncha deploy o‘chirilgan, test va artifact build ishlaydi.
+Main ga push avtomatik deploy qiladi; secrets va variables talab qilinadi.
 Qo‘lda ishga tushirish: Actions → Test and deploy backend → Run workflow.
 
 Upload `.env`, `.git`, arxivlar, testlar va `node_modules` ni yubormaydi yoki
