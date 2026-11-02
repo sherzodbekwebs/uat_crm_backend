@@ -10,7 +10,10 @@ import {
   Put,
   Body,
   Param,
+  Query,
   Req,
+  Res,
+  HttpCode,
   UseGuards,
   Injectable,
   CanActivate,
@@ -31,7 +34,7 @@ import { JwtModule, JwtService } from '@nestjs/jwt';
 import { compare, hash } from 'bcryptjs';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { randomUUID } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 import { pool } from './database';
@@ -117,6 +120,338 @@ const loginSchema = z.object({
 const idSchema = z.string().uuid();
 
 const versionSchema = z.number().int().positive();
+
+
+const INSTAGRAM_SINGLETON_ID = 1;
+const INSTAGRAM_24_HOURS_MS = 24 * 60 * 60 * 1000;
+
+function instagramIsConfigured() {
+  const key = process.env.INSTAGRAM_TOKEN_ENCRYPTION_KEY || '';
+  return Boolean(process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET &&
+    process.env.INSTAGRAM_REDIRECT_URI && process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN &&
+    /^[a-f0-9]{64}$/i.test(key));
+}
+
+function instagramConfig() {
+  if (!instagramIsConfigured()) throw new ServiceUnavailableException('Instagram sozlamalari serverda to‘liq kiritilmagan');
+  const apiVersion = process.env.INSTAGRAM_GRAPH_API_VERSION || 'v26.0';
+  if (!/^v\d+\.\d+$/.test(apiVersion)) throw new ServiceUnavailableException('Instagram Graph API versiyasi noto‘g‘ri');
+  return {
+    appId: process.env.INSTAGRAM_APP_ID!.trim(),
+    appSecret: process.env.INSTAGRAM_APP_SECRET!.trim(),
+    redirectUri: process.env.INSTAGRAM_REDIRECT_URI!.trim(),
+    verifyToken: process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN!.trim(),
+    encryptionKey: Buffer.from(process.env.INSTAGRAM_TOKEN_ENCRYPTION_KEY!, 'hex'),
+    apiVersion,
+  };
+}
+
+function constantTimeTextEqual(left: string, right: string) {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function encryptInstagramToken(token: string) {
+  const key = instagramConfig().encryptionKey;
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(token, 'utf8'), cipher.final()]);
+  return ['v1', iv.toString('base64'), cipher.getAuthTag().toString('base64'), encrypted.toString('base64')].join(':');
+}
+
+function decryptInstagramToken(value: string) {
+  const parts = value.split(':');
+  if (parts.length !== 4 || parts[0] !== 'v1') throw new ServiceUnavailableException('Instagram token format noto‘g‘ri');
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', instagramConfig().encryptionKey, Buffer.from(parts[1], 'base64'));
+    decipher.setAuthTag(Buffer.from(parts[2], 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(parts[3], 'base64')), decipher.final()]).toString('utf8');
+  } catch {
+    throw new ServiceUnavailableException('Instagram tokenini ochib bo‘lmadi. Encryption key sozlamasini tekshiring.');
+  }
+}
+
+async function instagramFetch(url: string, init: RequestInit = {}) {
+  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(20000) });
+  const data: any = await response.json().catch(() => ({}));
+  if (!response.ok || data?.error) {
+    const message = typeof data?.error?.message === 'string' ? data.error.message : 'Instagram API so‘rovi bajarilmadi';
+    throw new Error(message.slice(0, 300));
+  }
+  return data;
+}
+
+async function instagramAccount() {
+  const result = await pool.query(
+    'SELECT id, ig_user_id, username, access_token_encrypted, token_expires_at, webhook_subscribed, connected_at FROM instagram_accounts WHERE id = $1',
+    [INSTAGRAM_SINGLETON_ID],
+  );
+  return result.rows[0] || null;
+}
+
+async function instagramAccessToken(account: any) {
+  let token = decryptInstagramToken(account.access_token_encrypted);
+  const expiresAt = account.token_expires_at ? new Date(account.token_expires_at).getTime() : 0;
+  if (expiresAt && expiresAt <= Date.now()) throw new ServiceUnavailableException('Instagram sessiyasi tugagan. Akkauntni qayta ulang.');
+  if (expiresAt && expiresAt - Date.now() < 10 * 24 * 60 * 60 * 1000) {
+    try {
+      const url = new URL('https://graph.instagram.com/refresh_access_token');
+      url.searchParams.set('grant_type', 'ig_refresh_token');
+      url.searchParams.set('access_token', token);
+      const refreshed: any = await instagramFetch(url.toString());
+      if (typeof refreshed.access_token === 'string') {
+        token = refreshed.access_token;
+        const seconds = Number(refreshed.expires_in) || 5184000;
+        await pool.query(
+          'UPDATE instagram_accounts SET access_token_encrypted = $1, token_expires_at = $2 WHERE id = $3',
+          [encryptInstagramToken(token), new Date(Date.now() + seconds * 1000), INSTAGRAM_SINGLETON_ID],
+        );
+      }
+    } catch {
+      throw new ServiceUnavailableException('Instagram tokenini yangilab bo‘lmadi. Akkauntni qayta ulang.');
+    }
+  }
+  return token;
+}
+
+function instagramFrontendRedirect(result: string, webhook: string) {
+  const origin = (process.env.FRONTEND_ORIGIN || 'http://localhost:5173').split(',')[0].trim().replace(/\/+$/, '');
+  const url = new URL('/', origin);
+  url.searchParams.set('instagram', result);
+  if (webhook) url.searchParams.set('webhook', webhook);
+  return url.toString();
+}
+
+async function persistInstagramWebhookEvent(entry: any, event: any) {
+  const accountId = String(entry?.id || '');
+  const message = event?.message;
+  if (!accountId || !message || message.is_deleted || message.is_unsent) return;
+  const account = await pool.query('SELECT ig_user_id FROM instagram_accounts WHERE id = $1 AND ig_user_id = $2', [INSTAGRAM_SINGLETON_ID, accountId]);
+  if (!account.rowCount) return;
+
+  const senderId = String(event?.sender?.id || '');
+  const recipientId = String(event?.recipient?.id || '');
+  const echo = Boolean(message.is_echo) || senderId === accountId;
+  const customerId = echo ? recipientId : senderId;
+  if (!customerId || customerId === accountId) return;
+
+  const direction = echo ? 'outbound' : 'inbound';
+  const timestamp = Number(event.timestamp) || Date.now();
+  const sentAt = new Date(timestamp);
+  const text = typeof message.text === 'string' ? message.text.slice(0, 5000) : '';
+  const attachments = (Array.isArray(message.attachments) ? message.attachments : []).slice(0, 10).map((item: any) => ({
+    type: typeof item?.type === 'string' ? item.type.slice(0, 40) : 'file',
+    url: typeof item?.payload?.url === 'string' && item.payload.url.startsWith('https://') ? item.payload.url.slice(0, 2000) : null,
+  }));
+  const fallback = attachments.length ? '[' + attachments.map((item: any) => item.type).join(', ') + ']' : '';
+  const lastText = text || fallback;
+  const externalId = String(message.mid || message.id || createHash('sha256').update([accountId, customerId, direction, timestamp, text].join(':')).digest('hex'));
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const conversation = await client.query(
+      'INSERT INTO instagram_conversations (ig_user_id, sender_id, sender_username, last_message_text, last_message_at, last_inbound_at) ' +
+      'VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 = \'inbound\' THEN $5 ELSE NULL END) ' +
+      'ON CONFLICT (ig_user_id, sender_id) DO UPDATE SET ' +
+      'sender_username = COALESCE(NULLIF(EXCLUDED.sender_username, \'\'), instagram_conversations.sender_username), ' +
+      'last_message_text = EXCLUDED.last_message_text, ' +
+      'last_message_at = GREATEST(instagram_conversations.last_message_at, EXCLUDED.last_message_at), ' +
+      'last_inbound_at = CASE WHEN $6 = \'inbound\' THEN GREATEST(COALESCE(instagram_conversations.last_inbound_at, EXCLUDED.last_inbound_at), EXCLUDED.last_inbound_at) ELSE instagram_conversations.last_inbound_at END, ' +
+      'updated_at = NOW() RETURNING id',
+      [accountId, customerId, echo ? '' : String(event?.sender?.username || '').slice(0, 100), lastText, sentAt, direction],
+    );
+    const inserted = await client.query(
+      'INSERT INTO instagram_messages (conversation_id, external_message_id, direction, message_text, attachments, sent_at) ' +
+      'VALUES ($1, $2, $3, $4, $5::jsonb, $6) ON CONFLICT (external_message_id) DO NOTHING RETURNING id',
+      [conversation.rows[0].id, externalId, direction, text, JSON.stringify(attachments), sentAt],
+    );
+    if (inserted.rowCount && direction === 'inbound') {
+      await client.query('UPDATE instagram_conversations SET unread_count = unread_count + 1 WHERE id = $1', [conversation.rows[0].id]);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function persistInstagramWebhook(body: any) {
+  const entries = Array.isArray(body?.entry) ? body.entry : [];
+  for (const entry of entries) {
+    const events = Array.isArray(entry?.messaging) ? entry.messaging : [];
+    for (const event of events) await persistInstagramWebhookEvent(entry, event);
+  }
+}
+
+
+const INSTAGRAM_SINGLETON_ID = 1;
+const INSTAGRAM_24_HOURS_MS = 24 * 60 * 60 * 1000;
+
+function instagramIsConfigured() {
+  const key = process.env.INSTAGRAM_TOKEN_ENCRYPTION_KEY || '';
+  return Boolean(process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET &&
+    process.env.INSTAGRAM_REDIRECT_URI && process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN &&
+    /^[a-f0-9]{64}$/i.test(key));
+}
+
+function instagramConfig() {
+  if (!instagramIsConfigured()) throw new ServiceUnavailableException('Instagram sozlamalari serverda to‘liq kiritilmagan');
+  const apiVersion = process.env.INSTAGRAM_GRAPH_API_VERSION || 'v26.0';
+  if (!/^v\d+\.\d+$/.test(apiVersion)) throw new ServiceUnavailableException('Instagram Graph API versiyasi noto‘g‘ri');
+  return {
+    appId: process.env.INSTAGRAM_APP_ID!.trim(),
+    appSecret: process.env.INSTAGRAM_APP_SECRET!.trim(),
+    redirectUri: process.env.INSTAGRAM_REDIRECT_URI!.trim(),
+    verifyToken: process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN!.trim(),
+    encryptionKey: Buffer.from(process.env.INSTAGRAM_TOKEN_ENCRYPTION_KEY!, 'hex'),
+    apiVersion,
+  };
+}
+
+function constantTimeTextEqual(left: string, right: string) {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function encryptInstagramToken(token: string) {
+  const key = instagramConfig().encryptionKey;
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(token, 'utf8'), cipher.final()]);
+  return ['v1', iv.toString('base64'), cipher.getAuthTag().toString('base64'), encrypted.toString('base64')].join(':');
+}
+
+function decryptInstagramToken(value: string) {
+  const parts = value.split(':');
+  if (parts.length !== 4 || parts[0] !== 'v1') throw new ServiceUnavailableException('Instagram token format noto‘g‘ri');
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', instagramConfig().encryptionKey, Buffer.from(parts[1], 'base64'));
+    decipher.setAuthTag(Buffer.from(parts[2], 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(parts[3], 'base64')), decipher.final()]).toString('utf8');
+  } catch {
+    throw new ServiceUnavailableException('Instagram tokenini ochib bo‘lmadi. Encryption key sozlamasini tekshiring.');
+  }
+}
+
+async function instagramFetch(url: string, init: RequestInit = {}) {
+  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(20000) });
+  const data: any = await response.json().catch(() => ({}));
+  if (!response.ok || data?.error) {
+    const message = typeof data?.error?.message === 'string' ? data.error.message : 'Instagram API so‘rovi bajarilmadi';
+    throw new Error(message.slice(0, 300));
+  }
+  return data;
+}
+
+async function instagramAccount() {
+  const result = await pool.query(
+    'SELECT id, ig_user_id, username, access_token_encrypted, token_expires_at, webhook_subscribed, connected_at FROM instagram_accounts WHERE id = $1',
+    [INSTAGRAM_SINGLETON_ID],
+  );
+  return result.rows[0] || null;
+}
+
+async function instagramAccessToken(account: any) {
+  let token = decryptInstagramToken(account.access_token_encrypted);
+  const expiresAt = account.token_expires_at ? new Date(account.token_expires_at).getTime() : 0;
+  if (expiresAt && expiresAt <= Date.now()) throw new ServiceUnavailableException('Instagram sessiyasi tugagan. Akkauntni qayta ulang.');
+  if (expiresAt && expiresAt - Date.now() < 10 * 24 * 60 * 60 * 1000) {
+    try {
+      const url = new URL('https://graph.instagram.com/refresh_access_token');
+      url.searchParams.set('grant_type', 'ig_refresh_token');
+      url.searchParams.set('access_token', token);
+      const refreshed: any = await instagramFetch(url.toString());
+      if (typeof refreshed.access_token === 'string') {
+        token = refreshed.access_token;
+        const seconds = Number(refreshed.expires_in) || 5184000;
+        await pool.query(
+          'UPDATE instagram_accounts SET access_token_encrypted = $1, token_expires_at = $2 WHERE id = $3',
+          [encryptInstagramToken(token), new Date(Date.now() + seconds * 1000), INSTAGRAM_SINGLETON_ID],
+        );
+      }
+    } catch {
+      throw new ServiceUnavailableException('Instagram tokenini yangilab bo‘lmadi. Akkauntni qayta ulang.');
+    }
+  }
+  return token;
+}
+
+function instagramFrontendRedirect(result: string, webhook: string) {
+  const origin = (process.env.FRONTEND_ORIGIN || 'http://localhost:5173').split(',')[0].trim().replace(/\/+$/, '');
+  const url = new URL('/', origin);
+  url.searchParams.set('instagram', result);
+  if (webhook) url.searchParams.set('webhook', webhook);
+  return url.toString();
+}
+
+async function persistInstagramWebhookEvent(entry: any, event: any) {
+  const accountId = String(entry?.id || '');
+  const message = event?.message;
+  if (!accountId || !message || message.is_deleted || message.is_unsent) return;
+  const account = await pool.query('SELECT ig_user_id FROM instagram_accounts WHERE id = $1 AND ig_user_id = $2', [INSTAGRAM_SINGLETON_ID, accountId]);
+  if (!account.rowCount) return;
+
+  const senderId = String(event?.sender?.id || '');
+  const recipientId = String(event?.recipient?.id || '');
+  const echo = Boolean(message.is_echo) || senderId === accountId;
+  const customerId = echo ? recipientId : senderId;
+  if (!customerId || customerId === accountId) return;
+
+  const direction = echo ? 'outbound' : 'inbound';
+  const timestamp = Number(event.timestamp) || Date.now();
+  const sentAt = new Date(timestamp);
+  const text = typeof message.text === 'string' ? message.text.slice(0, 5000) : '';
+  const attachments = (Array.isArray(message.attachments) ? message.attachments : []).slice(0, 10).map((item: any) => ({
+    type: typeof item?.type === 'string' ? item.type.slice(0, 40) : 'file',
+    url: typeof item?.payload?.url === 'string' && item.payload.url.startsWith('https://') ? item.payload.url.slice(0, 2000) : null,
+  }));
+  const fallback = attachments.length ? '[' + attachments.map((item: any) => item.type).join(', ') + ']' : '';
+  const lastText = text || fallback;
+  const externalId = String(message.mid || message.id || createHash('sha256').update([accountId, customerId, direction, timestamp, text].join(':')).digest('hex'));
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const conversation = await client.query(
+      'INSERT INTO instagram_conversations (ig_user_id, sender_id, sender_username, last_message_text, last_message_at, last_inbound_at) ' +
+      'VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 = \'inbound\' THEN $5 ELSE NULL END) ' +
+      'ON CONFLICT (ig_user_id, sender_id) DO UPDATE SET ' +
+      'sender_username = COALESCE(NULLIF(EXCLUDED.sender_username, \'\'), instagram_conversations.sender_username), ' +
+      'last_message_text = EXCLUDED.last_message_text, ' +
+      'last_message_at = GREATEST(instagram_conversations.last_message_at, EXCLUDED.last_message_at), ' +
+      'last_inbound_at = CASE WHEN $6 = \'inbound\' THEN GREATEST(COALESCE(instagram_conversations.last_inbound_at, EXCLUDED.last_inbound_at), EXCLUDED.last_inbound_at) ELSE instagram_conversations.last_inbound_at END, ' +
+      'updated_at = NOW() RETURNING id',
+      [accountId, customerId, echo ? '' : String(event?.sender?.username || '').slice(0, 100), lastText, sentAt, direction],
+    );
+    const inserted = await client.query(
+      'INSERT INTO instagram_messages (conversation_id, external_message_id, direction, message_text, attachments, sent_at) ' +
+      'VALUES ($1, $2, $3, $4, $5::jsonb, $6) ON CONFLICT (external_message_id) DO NOTHING RETURNING id',
+      [conversation.rows[0].id, externalId, direction, text, JSON.stringify(attachments), sentAt],
+    );
+    if (inserted.rowCount && direction === 'inbound') {
+      await client.query('UPDATE instagram_conversations SET unread_count = unread_count + 1 WHERE id = $1', [conversation.rows[0].id]);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function persistInstagramWebhook(body: any) {
+  const entries = Array.isArray(body?.entry) ? body.entry : [];
+  for (const entry of entries) {
+    const events = Array.isArray(entry?.messaging) ? entry.messaging : [];
+    for (const event of events) await persistInstagramWebhookEvent(entry, event);
+  }
+}
 
 // ========================================
 // 3. TYPES
@@ -254,6 +589,224 @@ class ApiController {
         'Database connection unavailable',
       );
     }
+  }
+
+
+  // ----------------------------------------
+  // INSTAGRAM DIRECT
+  // ----------------------------------------
+
+  @Get('instagram/status')
+  @UseGuards(AuthGuard)
+  async instagramStatus() {
+    const account = await instagramAccount();
+    return {
+      connected: Boolean(account),
+      setupReady: instagramIsConfigured(),
+      username: account?.username || null,
+      igUserId: account?.ig_user_id || null,
+      connectedAt: account?.connected_at || null,
+      tokenExpiresAt: account?.token_expires_at || null,
+      webhookSubscribed: Boolean(account?.webhook_subscribed),
+    };
+  }
+
+  @Get('instagram/connect')
+  @UseGuards(AuthGuard)
+  async instagramConnect(@Req() req: AuthRequest) {
+    if (req.user.role !== 'admin') throw new ForbiddenException('Instagram akkauntini faqat administrator ulashi mumkin');
+    const config = instagramConfig();
+    const state = await this.jwt.signAsync({ sub: req.user.id, purpose: 'instagram-connect' }, { expiresIn: '10m' });
+    const url = new URL('https://www.instagram.com/oauth/authorize');
+    url.searchParams.set('client_id', config.appId);
+    url.searchParams.set('redirect_uri', config.redirectUri);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('scope', 'instagram_business_basic,instagram_business_manage_messages');
+    url.searchParams.set('state', state);
+    return { url: url.toString() };
+  }
+
+  @Get('instagram/callback')
+  async instagramCallback(@Query('code') code: string, @Query('state') state: string, @Query('error') oauthError: string, @Res() res: any) {
+    if (oauthError || !code || !state) return res.redirect(302, instagramFrontendRedirect('error', ''));
+    try {
+      const config = instagramConfig();
+      const claims: any = await this.jwt.verifyAsync(state);
+      const userId = Number(claims?.sub);
+      if (claims?.purpose !== 'instagram-connect' || !Number.isSafeInteger(userId) || userId < 1) {
+        return res.redirect(302, instagramFrontendRedirect('error', ''));
+      }
+      const user = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
+      if (!user.rowCount) return res.redirect(302, instagramFrontendRedirect('error', ''));
+
+      const tokenForm = new URLSearchParams({
+        client_id: config.appId,
+        client_secret: config.appSecret,
+        grant_type: 'authorization_code',
+        redirect_uri: config.redirectUri,
+        code,
+      });
+      const shortToken: any = await instagramFetch('https://api.instagram.com/oauth/access_token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: tokenForm.toString(),
+      });
+      if (typeof shortToken.access_token !== 'string') throw new Error('Instagram token exchange failed');
+
+      const longTokenUrl = new URL('https://graph.instagram.com/access_token');
+      longTokenUrl.searchParams.set('grant_type', 'ig_exchange_token');
+      longTokenUrl.searchParams.set('client_secret', config.appSecret);
+      longTokenUrl.searchParams.set('access_token', shortToken.access_token);
+      const longToken: any = await instagramFetch(longTokenUrl.toString());
+      const accessToken = typeof longToken.access_token === 'string' ? longToken.access_token : shortToken.access_token;
+      const profileUrl = new URL('https://graph.instagram.com/' + config.apiVersion + '/me');
+      profileUrl.searchParams.set('fields', 'user_id,username');
+      profileUrl.searchParams.set('access_token', accessToken);
+      const profile: any = await instagramFetch(profileUrl.toString());
+      const igUserId = String(profile.user_id || profile.id || shortToken.user_id || '');
+      if (!igUserId) throw new Error('Instagram account ID was not returned');
+      const username = String(profile.username || 'Instagram account').slice(0, 100);
+      const expiresIn = Number(longToken.expires_in) || Number(shortToken.expires_in) || 5184000;
+      let webhookSubscribed = false;
+      try {
+        const subscribeUrl = new URL('https://graph.instagram.com/' + config.apiVersion + '/' + encodeURIComponent(igUserId) + '/subscribed_apps');
+        subscribeUrl.searchParams.set('subscribed_fields', 'messages');
+        const subscription: any = await instagramFetch(subscribeUrl.toString(), {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + accessToken },
+        });
+        webhookSubscribed = subscription.success === true || subscription.success === 'true';
+      } catch {
+        webhookSubscribed = false;
+      }
+
+      await pool.query(
+        'INSERT INTO instagram_accounts (id, ig_user_id, username, access_token_encrypted, token_expires_at, webhook_subscribed, connected_by, connected_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) ' +
+        'ON CONFLICT (id) DO UPDATE SET ig_user_id = EXCLUDED.ig_user_id, username = EXCLUDED.username, ' +
+        'access_token_encrypted = EXCLUDED.access_token_encrypted, token_expires_at = EXCLUDED.token_expires_at, ' +
+        'webhook_subscribed = EXCLUDED.webhook_subscribed, connected_by = EXCLUDED.connected_by, connected_at = NOW()',
+        [INSTAGRAM_SINGLETON_ID, igUserId, username, encryptInstagramToken(accessToken), new Date(Date.now() + expiresIn * 1000), webhookSubscribed, userId],
+      );
+      return res.redirect(302, instagramFrontendRedirect('connected', webhookSubscribed ? '' : 'check'));
+    } catch {
+      return res.redirect(302, instagramFrontendRedirect('error', ''));
+    }
+  }
+
+  @Post('instagram/disconnect')
+  @UseGuards(AuthGuard)
+  async instagramDisconnect(@Req() req: AuthRequest) {
+    if (req.user.role !== 'admin') throw new ForbiddenException('Instagram akkauntini faqat administrator uzishi mumkin');
+    await pool.query('DELETE FROM instagram_accounts WHERE id = $1', [INSTAGRAM_SINGLETON_ID]);
+    return { ok: true };
+  }
+
+  @Get('instagram/conversations')
+  @UseGuards(AuthGuard)
+  async instagramConversations() {
+    const { rows } = await pool.query(
+      'SELECT id, sender_id AS "senderId", sender_username AS username, last_message_text AS "lastMessage", ' +
+      'last_message_at AS "lastMessageAt", last_inbound_at AS "lastInboundAt", unread_count AS "unreadCount" ' +
+      'FROM instagram_conversations ORDER BY last_message_at DESC LIMIT 200',
+    );
+    return rows;
+  }
+
+  @Get('instagram/conversations/:id/messages')
+  @UseGuards(AuthGuard)
+  async instagramMessages(@Param('id') rawId: string) {
+    const id = parse(z.coerce.number().int().positive(), rawId);
+    const conversation = await pool.query('UPDATE instagram_conversations SET unread_count = 0 WHERE id = $1 RETURNING id', [id]);
+    if (!conversation.rowCount) throw new NotFoundException('Instagram suhbati topilmadi');
+    const { rows } = await pool.query(
+      'SELECT id, direction, message_text AS text, attachments, sent_at AS "sentAt" ' +
+      'FROM instagram_messages WHERE conversation_id = $1 ORDER BY sent_at DESC, id DESC LIMIT 200',
+      [id],
+    );
+    return rows.reverse();
+  }
+
+  @Post('instagram/conversations/:id/messages')
+  @UseGuards(AuthGuard)
+  async instagramSendMessage(@Param('id') rawId: string, @Body() body: unknown) {
+    const id = parse(z.coerce.number().int().positive(), rawId);
+    const data = parse(z.object({ text: z.string().trim().min(1).max(1000) }).strict(), body);
+    const { rows } = await pool.query(
+      'SELECT c.id, c.sender_id, c.last_inbound_at, a.ig_user_id ' +
+      'FROM instagram_conversations c JOIN instagram_accounts a ON a.ig_user_id = c.ig_user_id AND a.id = $2 ' +
+      'WHERE c.id = $1',
+      [id, INSTAGRAM_SINGLETON_ID],
+    );
+    const conversation = rows[0];
+    if (!conversation) throw new NotFoundException('Instagram suhbati topilmadi');
+    const lastInboundAt = conversation.last_inbound_at ? new Date(conversation.last_inbound_at).getTime() : 0;
+    if (!lastInboundAt || Date.now() - lastInboundAt > INSTAGRAM_24_HOURS_MS) {
+      throw new BadRequestException('24 soatlik javob oynasi tugagan. Instagram orqali javob yuborib bo‘lmaydi.');
+    }
+
+    const account = await instagramAccount();
+    if (!account) throw new ServiceUnavailableException('Instagram akkaunti ulanmagan');
+    const config = instagramConfig();
+    const accessToken = await instagramAccessToken(account);
+    const sendUrl = 'https://graph.instagram.com/' + config.apiVersion + '/' + encodeURIComponent(conversation.ig_user_id) + '/messages';
+    let sent: any;
+    try {
+      sent = await instagramFetch(sendUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken },
+        body: JSON.stringify({ recipient: { id: conversation.sender_id }, message: { text: data.text } }),
+      });
+    } catch {
+      throw new ServiceUnavailableException('Instagram xabarni yubormadi. Ulanishni yoki Meta ruxsatlarini tekshiring.');
+    }
+
+    const sentAt = new Date();
+    const externalId = String(sent.message_id || sent.id || 'crm:' + randomUUID());
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'INSERT INTO instagram_messages (conversation_id, external_message_id, direction, message_text, attachments, sent_at) ' +
+        'VALUES ($1, $2, \'outbound\', $3, \'[]\'::jsonb, $4) ON CONFLICT (external_message_id) DO NOTHING',
+        [id, externalId, data.text, sentAt],
+      );
+      await client.query(
+        'UPDATE instagram_conversations SET last_message_text = $1, last_message_at = $2, updated_at = NOW() WHERE id = $3',
+        [data.text, sentAt, id],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
+    } finally {
+      client.release();
+    }
+    return { ok: true, messageId: externalId, sentAt };
+  }
+
+  @Get('instagram/webhook')
+  async instagramWebhookVerify(@Query('hub.mode') mode: string, @Query('hub.verify_token') verifyToken: string, @Query('hub.challenge') challenge: string, @Res() res: any) {
+    const expected = process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN || '';
+    if (!expected || mode !== 'subscribe' || !constantTimeTextEqual(verifyToken || '', expected)) {
+      return res.status(403).type('text/plain').send('Forbidden');
+    }
+    return res.status(200).type('text/plain').send(challenge || '');
+  }
+
+  @Post('instagram/webhook')
+  @HttpCode(200)
+  async instagramWebhook(@Req() req: any) {
+    const appSecret = process.env.INSTAGRAM_APP_SECRET || '';
+    const rawBody = req.rawBody;
+    const signature = String(req.headers?.['x-hub-signature-256'] || '');
+    if (!appSecret || !Buffer.isBuffer(rawBody) || !signature.startsWith('sha256=')) {
+      throw new UnauthorizedException('Instagram webhook imzosi noto‘g‘ri');
+    }
+    const expected = 'sha256=' + createHmac('sha256', appSecret).update(rawBody).digest('hex');
+    if (!constantTimeTextEqual(signature, expected)) throw new UnauthorizedException('Instagram webhook imzosi noto‘g‘ri');
+    await persistInstagramWebhook(req.body);
+    return { received: true };
   }
 
   // ----------------------------------------
@@ -668,7 +1221,7 @@ class AppModule {}
 
 export async function start() {
   const app = await NestFactory.create(AppModule, {
-    rawBody: false,
+    rawBody: true,
   });
 
   // Hide NestJS fingerprinting header.
