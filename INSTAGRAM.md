@@ -34,6 +34,11 @@ Set these values in the backend's production environment (do not commit them):
 
 The OAuth token is stored encrypted with AES-256-GCM. Keep the encryption key stable; changing it requires reconnecting Instagram. The Meta app secret and access token must never be placed in the frontend.
 
+Set `FRONTEND_ORIGIN` to the real CRM origin. If it contains a comma-separated
+allowlist, the first origin is the OAuth return destination. Do not leave a
+localhost origin first in production. Restart the cPanel Node application after
+changing environment variables.
+
 After deploying the backend, run the additive database migration once from the backend app root:
 
 ```sh
@@ -50,3 +55,4 @@ Official references:
 - [Meta Instagram API collection](https://www.postman.com/meta/instagram/documentation/6yqw8pt/instagram-api)
 - [Instagram Messaging API overview](https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/messaging-api)
 - [Business Login for Instagram](https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/business-login)
+
