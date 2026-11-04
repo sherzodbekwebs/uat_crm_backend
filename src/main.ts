@@ -128,6 +128,7 @@ const INSTAGRAM_24_HOURS_MS = 24 * 60 * 60 * 1000;
 function instagramIsConfigured() {
   const key = process.env.INSTAGRAM_TOKEN_ENCRYPTION_KEY || '';
   return Boolean(process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET &&
+    process.env.INSTAGRAM_CONFIG_ID && process.env.INSTAGRAM_ACCOUNT_ID &&
     process.env.INSTAGRAM_REDIRECT_URI && process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN &&
     /^[a-f0-9]{64}$/i.test(key));
 }
@@ -139,6 +140,8 @@ function instagramConfig() {
   return {
     appId: process.env.INSTAGRAM_APP_ID!.trim(),
     appSecret: process.env.INSTAGRAM_APP_SECRET!.trim(),
+    configId: process.env.INSTAGRAM_CONFIG_ID!.trim(),
+    instagramAccountId: process.env.INSTAGRAM_ACCOUNT_ID!.trim(),
     redirectUri: process.env.INSTAGRAM_REDIRECT_URI!.trim(),
     verifyToken: process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN!.trim(),
     encryptionKey: Buffer.from(process.env.INSTAGRAM_TOKEN_ENCRYPTION_KEY!, 'hex'),
@@ -191,27 +194,9 @@ async function instagramAccount() {
 }
 
 async function instagramAccessToken(account: any) {
-  let token = decryptInstagramToken(account.access_token_encrypted);
+  const token = decryptInstagramToken(account.access_token_encrypted);
   const expiresAt = account.token_expires_at ? new Date(account.token_expires_at).getTime() : 0;
   if (expiresAt && expiresAt <= Date.now()) throw new ServiceUnavailableException('Instagram sessiyasi tugagan. Akkauntni qayta ulang.');
-  if (expiresAt && expiresAt - Date.now() < 10 * 24 * 60 * 60 * 1000) {
-    try {
-      const url = new URL('https://graph.instagram.com/refresh_access_token');
-      url.searchParams.set('grant_type', 'ig_refresh_token');
-      url.searchParams.set('access_token', token);
-      const refreshed: any = await instagramFetch(url.toString());
-      if (typeof refreshed.access_token === 'string') {
-        token = refreshed.access_token;
-        const seconds = Number(refreshed.expires_in) || 5184000;
-        await pool.query(
-          'UPDATE instagram_accounts SET access_token_encrypted = $1, token_expires_at = $2 WHERE id = $3',
-          [encryptInstagramToken(token), new Date(Date.now() + seconds * 1000), INSTAGRAM_SINGLETON_ID],
-        );
-      }
-    } catch {
-      throw new ServiceUnavailableException('Instagram tokenini yangilab bo‘lmadi. Akkauntni qayta ulang.');
-    }
-  }
   return token;
 }
 
@@ -451,11 +436,12 @@ class ApiController {
     if (req.user.role !== 'admin') throw new ForbiddenException('Instagram akkauntini faqat administrator ulashi mumkin');
     const config = instagramConfig();
     const state = await this.jwt.signAsync({ sub: req.user.id, purpose: 'instagram-connect' }, { expiresIn: '10m' });
-    const url = new URL('https://www.instagram.com/oauth/authorize');
+    const url = new URL('https://www.facebook.com/dialog/oauth');
     url.searchParams.set('client_id', config.appId);
+    url.searchParams.set('config_id', config.configId);
     url.searchParams.set('redirect_uri', config.redirectUri);
     url.searchParams.set('response_type', 'code');
-    url.searchParams.set('scope', 'instagram_business_basic,instagram_business_manage_messages');
+    url.searchParams.set('override_default_response_type', 'true');
     url.searchParams.set('state', state);
     return { url: url.toString() };
   }
@@ -473,37 +459,26 @@ class ApiController {
       const user = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
       if (!user.rowCount) return res.redirect(302, instagramFrontendRedirect('error', ''));
 
-      const tokenForm = new URLSearchParams({
-        client_id: config.appId,
-        client_secret: config.appSecret,
-        grant_type: 'authorization_code',
-        redirect_uri: config.redirectUri,
-        code,
-      });
-      const shortToken: any = await instagramFetch('https://api.instagram.com/oauth/access_token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: tokenForm.toString(),
-      });
-      if (typeof shortToken.access_token !== 'string') throw new Error('Instagram token exchange failed');
-
-      const longTokenUrl = new URL('https://graph.instagram.com/access_token');
-      longTokenUrl.searchParams.set('grant_type', 'ig_exchange_token');
-      longTokenUrl.searchParams.set('client_secret', config.appSecret);
-      longTokenUrl.searchParams.set('access_token', shortToken.access_token);
-      const longToken: any = await instagramFetch(longTokenUrl.toString());
-      const accessToken = typeof longToken.access_token === 'string' ? longToken.access_token : shortToken.access_token;
-      const profileUrl = new URL('https://graph.instagram.com/' + config.apiVersion + '/me');
-      profileUrl.searchParams.set('fields', 'user_id,username');
+      const tokenUrl = new URL('https://graph.facebook.com/' + config.apiVersion + '/oauth/access_token');
+      tokenUrl.searchParams.set('client_id', config.appId);
+      tokenUrl.searchParams.set('client_secret', config.appSecret);
+      tokenUrl.searchParams.set('redirect_uri', config.redirectUri);
+      tokenUrl.searchParams.set('code', code);
+      const tokenResult: any = await instagramFetch(tokenUrl.toString());
+      if (typeof tokenResult.access_token !== 'string') throw new Error('Meta token exchange failed');
+      const accessToken = tokenResult.access_token;
+      const profileUrl = new URL('https://graph.facebook.com/' + config.apiVersion + '/' + encodeURIComponent(config.instagramAccountId));
+      profileUrl.searchParams.set('fields', 'id,username');
       profileUrl.searchParams.set('access_token', accessToken);
       const profile: any = await instagramFetch(profileUrl.toString());
-      const igUserId = String(profile.user_id || profile.id || shortToken.user_id || '');
+      const igUserId = String(profile.id || config.instagramAccountId);
       if (!igUserId) throw new Error('Instagram account ID was not returned');
       const username = String(profile.username || 'Instagram account').slice(0, 100);
-      const expiresIn = Number(longToken.expires_in) || Number(shortToken.expires_in) || 5184000;
+      const expiresIn = Number(tokenResult.expires_in);
+      const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000) : null;
       let webhookSubscribed = false;
       try {
-        const subscribeUrl = new URL('https://graph.instagram.com/' + config.apiVersion + '/' + encodeURIComponent(igUserId) + '/subscribed_apps');
+        const subscribeUrl = new URL('https://graph.facebook.com/' + config.apiVersion + '/' + encodeURIComponent(igUserId) + '/subscribed_apps');
         subscribeUrl.searchParams.set('subscribed_fields', 'messages');
         const subscription: any = await instagramFetch(subscribeUrl.toString(), {
           method: 'POST',
@@ -520,7 +495,7 @@ class ApiController {
         'ON CONFLICT (id) DO UPDATE SET ig_user_id = EXCLUDED.ig_user_id, username = EXCLUDED.username, ' +
         'access_token_encrypted = EXCLUDED.access_token_encrypted, token_expires_at = EXCLUDED.token_expires_at, ' +
         'webhook_subscribed = EXCLUDED.webhook_subscribed, connected_by = EXCLUDED.connected_by, connected_at = NOW()',
-        [INSTAGRAM_SINGLETON_ID, igUserId, username, encryptInstagramToken(accessToken), new Date(Date.now() + expiresIn * 1000), webhookSubscribed, userId],
+        [INSTAGRAM_SINGLETON_ID, igUserId, username, encryptInstagramToken(accessToken), expiresAt, webhookSubscribed, userId],
       );
       return res.redirect(302, instagramFrontendRedirect('connected', webhookSubscribed ? '' : 'check'));
     } catch {
@@ -583,7 +558,7 @@ class ApiController {
     if (!account) throw new ServiceUnavailableException('Instagram akkaunti ulanmagan');
     const config = instagramConfig();
     const accessToken = await instagramAccessToken(account);
-    const sendUrl = 'https://graph.instagram.com/' + config.apiVersion + '/' + encodeURIComponent(conversation.ig_user_id) + '/messages';
+    const sendUrl = 'https://graph.facebook.com/' + config.apiVersion + '/' + encodeURIComponent(conversation.ig_user_id) + '/messages';
     let sent: any;
     try {
       sent = await instagramFetch(sendUrl, {
@@ -1152,3 +1127,4 @@ if (require.main === module) {
     process.exitCode = 1;
   });
 }
+
