@@ -37,7 +37,18 @@ o‘chirmaydi. Production `.env` va cPanel boshqaradigan node_modules saqlanadi.
 FTP upload atomik emas: qisqa texnik xizmat oynasida deploy qilish ma’qul.
 Dependency va schema o‘zgarishlari alohida server qadamlarini talab qiladi. Instagram uchun yuqoridagi migratsiya buyrug‘idan foydalaning.
 
-Ochiq repozitoriyda `.env` fayli Git kuzatuvida turibdi. Uni Git kuzatuvidan chiqarish tarixdagi nusxani o‘chirmaydi; unda bo‘lgan haqiqiy parol va kalitlarni almashtiring.
+`.env` Git kuzatuvidan chiqarilgan; lokal va production nusxasi saqlanadi.
+Bu tarixdagi nusxani o‘chirmaydi. Oldin ochiq repozitoriyda bo‘lgan amaldagi
+database paroli, JWT secret va boshqa haqiqiy credentiallarni almashtirish kerak.
+Avval cPanel environment sozlamalari va ishlayotgan ulanishlarni tekshiring;
+database parolini bazada va backend environment’da muvofiqlashtirib yangilang,
+keyin ilovani qayta ishga tushirib health va loginni tekshiring. JWT secret
+almashtirilganda mavjud sessiyalar qayta login talab qiladi. Seed uchun ishlatilgan
+admin parolini environment’da almashtirish mavjud foydalanuvchi parolini avtomatik
+yangilamaydi: uni CRM foydalanuvchi boshqaruvida alohida yangilang.
+Maxfiy qiymatlarni log, PR yoki chatga chiqarmang. Git tarixini tozalash
+credentiallarni almashtirish o‘rnini bosmaydi va alohida kelishilgan ishdir.
 
 Passenger restart hujjati:
 https://support.cpanel.net/hc/en-us/articles/1500002443862-How-to-restart-an-application-that-s-using-cPanel-s-Application-Manager
+
