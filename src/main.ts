@@ -454,7 +454,6 @@ class ApiController {
     url.searchParams.set('redirect_uri', config.redirectUri);
     url.searchParams.set('response_type', 'code');
     url.searchParams.set('display', 'popup');
-    url.searchParams.set('override_default_response_type', 'true');
     url.searchParams.set('prompt', 'login');
     url.searchParams.set('state', state);
     return { url: url.toString() };
