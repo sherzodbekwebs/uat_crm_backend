@@ -21,10 +21,12 @@ CREATE TABLE IF NOT EXISTS instagram_accounts (
  username TEXT NOT NULL,
  access_token_encrypted TEXT NOT NULL,
  token_expires_at TIMESTAMPTZ,
+ login_type TEXT NOT NULL DEFAULT 'unified_login',
  webhook_subscribed BOOLEAN NOT NULL DEFAULT FALSE,
  connected_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
  connected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE instagram_accounts ADD COLUMN IF NOT EXISTS login_type TEXT NOT NULL DEFAULT 'unified_login';
 
 CREATE TABLE IF NOT EXISTS instagram_conversations (
  id BIGSERIAL PRIMARY KEY,

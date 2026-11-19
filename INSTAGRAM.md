@@ -1,45 +1,43 @@
-# Instagram Direct setup
+# Instagram Direct — Meta Unified Login
 
-CRM uses Meta's Instagram API with Unified Login (Facebook Login for Business configuration). It connects one shared Instagram professional account for the CRM; authorized CRM operators can read and reply to its conversations.
-
-## Requirements
-
-- An Instagram Business or Creator account. Personal accounts are not supported by this API.
-- A Meta app configured for Instagram API with Unified Login and a Facebook Login for Business configuration.
-- The configuration must use a System-user access token and grant `instagram_basic` and `instagram_manage_messages` to the Instagram business asset.
-- A public HTTPS backend URL for OAuth and webhooks.
-- For development, the Instagram account must be added as an Instagram Tester and accept the invitation. Live access for accounts outside the app's roles requires the relevant Meta review and access approvals.
+The CRM uses Meta's **Instagram API with Unified Login** through Facebook Login for Business. The account owner can sign in with Instagram or Facebook. A Facebook Page is not required. This is the setup shown for the existing `UAT CRM` app.
 
 ## Meta app configuration
 
-1. In the Meta developer dashboard, choose **Manage messaging & content on Instagram** and use **API setup with Unified Login**. Create a configuration with General login variation, System-user access token, the Instagram account asset, and only the needed messaging/basic permissions.
-2. Add the exact OAuth callback URI in the Unified Login setup:
+1. In Meta Developers, open `UAT CRM` under the **Sherzod** profile. Keep the existing app and the **Manage messaging & content on Instagram** use case.
+2. Open **Use cases → Manage messaging & content on Instagram → Customize → API setup with Unified login**. The app already has a selected configuration marked **Instagram Login Compatible**; the screenshot showed configuration ID `2282467869287683`.
+3. Edit or create a configuration that asks only for the Instagram asset and these permissions:
+   - `instagram_basic`
+   - `instagram_manage_messages`
+
+   Do not request ad account, publishing, comments, or insights permissions for this CRM inbox unless the product later needs them.
+4. Register this exact HTTPS redirect URL in the selected configuration:
    `https://crm-api.uzautotrailer.uz/api/instagram/callback`
-   Change the host if this backend is deployed elsewhere.
-3. Configure the Instagram webhook callback:
+5. Add `uzautotrailer_official` as an **Instagram Tester** while the app is in Development mode. The Instagram account owner must accept the invite in Instagram on the web: **Settings → Website permissions → Apps and websites → Tester Invites**.
+6. Under **Configure webhooks**, set the callback URL to:
    `https://crm-api.uzautotrailer.uz/api/instagram/webhook`
-   Use the same random value as `INSTAGRAM_WEBHOOK_VERIFY_TOKEN`, then subscribe to the `messages` field and enable the account's webhook subscription.
-4. Keep the CRM callback and Meta's login flow on the same exact HTTPS redirect URI.
+
+   Use the backend's `INSTAGRAM_WEBHOOK_VERIFY_TOKEN` and subscribe to `messages`.
+
+The CRM generates the Business Login URL using the Meta App ID, selected `config_id`, callback URL, and a signed `state`. Meta returns a short-lived code; the backend exchanges it server-side for a Business Integration System User Access Token and reads the Instagram account shared in that login.
 
 ## Backend environment
 
-Set these values in the backend's production environment (do not commit them):
+Set these values in the backend's production environment. Never commit app secrets or access tokens:
 
-- `INSTAGRAM_APP_ID`: Meta app ID from **App settings → Basic** (not the configuration ID or Instagram account ID).
-- `INSTAGRAM_APP_SECRET`: app secret; also used to validate webhook signatures.
-- `INSTAGRAM_CONFIG_ID`: ID of the Instagram API (Unified Login) configuration.
-- `INSTAGRAM_ACCOUNT_ID`: ID of the Instagram professional account selected for this CRM.
-- `INSTAGRAM_REDIRECT_URI`: exact callback URI configured in Meta.
-- `INSTAGRAM_WEBHOOK_VERIFY_TOKEN`: random secret used when Meta verifies the webhook.
-- `INSTAGRAM_TOKEN_ENCRYPTION_KEY`: 32-byte key encoded as 64 hexadecimal characters. Generate with `openssl rand -hex 32`.
-- `INSTAGRAM_GRAPH_API_VERSION`: defaults to `v26.0`.
+- `INSTAGRAM_APP_ID` — Meta App ID from **App settings → Basic**.
+- `INSTAGRAM_APP_SECRET` — Meta App Secret from **App settings → Basic**.
+- `INSTAGRAM_CONFIG_ID` — configuration ID shown in **API setup with Unified login**. The current selected ID is `2282467869287683`.
+- `INSTAGRAM_ACCOUNT_ID` — optional guard restricting the CRM to one specific Instagram professional account. Leave blank if the selected configuration shares exactly one account.
+- `INSTAGRAM_REDIRECT_URI` — must exactly match the URL registered in Meta.
+- `INSTAGRAM_WEBHOOK_VERIFY_TOKEN` — random value used by Meta to verify the callback.
+- `INSTAGRAM_TOKEN_ENCRYPTION_KEY` — 32-byte key in 64-character hexadecimal form. Generate with `openssl rand -hex 32`.
+- `INSTAGRAM_GRAPH_API_VERSION` — defaults to `v27.0`.
+- `FRONTEND_ORIGIN` — the real HTTPS CRM origin; it is where OAuth returns after connecting.
 
-Set `FRONTEND_ORIGIN` to the real CRM origin. If it contains a comma-separated
-allowlist, the first origin is the OAuth return destination. Do not leave a
-localhost origin first in production. Restart the cPanel Node application after
-changing environment variables.
+The backend stores the access token encrypted with AES-256-GCM. Keep the encryption key stable. If a configuration returns an expiring token, the CRM reports it disconnected after expiry and the Instagram account must be reconnected. Prefer a configuration with the appropriate token lifetime for the business's operational needs.
 
-OAuth uses Meta's `facebook.com/dialog/oauth` endpoint with `config_id`; token exchange and Instagram messaging calls use `graph.facebook.com`. The system-user token is stored encrypted with AES-256-GCM. Keep the encryption key stable; changing it requires reconnecting Instagram. The Meta app secret and access token must never be placed in the frontend or committed to Git.
+## Database and deployment
 
 After deploying the backend, run the additive database migration once from the backend app root:
 
@@ -47,14 +45,18 @@ After deploying the backend, run the additive database migration once from the b
 node dist/database.js migrate
 ```
 
-Then sign in to the CRM as an administrator and choose **Instagram Direct → Instagramni ulash**.
+Then sign in to the CRM as an administrator and choose **Instagram Direct → Instagramni ulash**. During Meta login, choose the Instagram login option, select the Instagram account, and approve the two requested permissions.
 
-## Message limits
+The app must be Live to receive webhook notifications. Production access also requires Meta's stated business verification and any applicable App Review/Advanced Access. Standard Access can be used for users with a role on the app; accounts without an app role require Advanced Access. For initial testing, add the Instagram account as an Instagram Tester and accept the invite.
 
-The CRM only enables replies for conversations where the Instagram user has messaged the connected account, and disables replies after the 24-hour response window. The official API does not support group conversations.
+## Messaging behavior
 
-Official references:
-- [Meta Instagram API collection](https://www.postman.com/meta/instagram/documentation/6yqw8pt/instagram-api)
-- [Facebook Login for Business](https://developers.facebook.com/docs/facebook-login/facebook-login-for-business/)
-- [Instagram Messaging API overview](https://developers.facebook.com/docs/instagram-platform/instagram-api-with-facebook-login/messaging-api)
+The CRM only enables replies for conversations where the Instagram user has messaged the connected account, and disables replies after the ordinary 24-hour response window. Group conversations are not supported.
 
+Official Meta references:
+
+- [Instagram API with Unified Login](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-unified-login)
+- [Get started with Unified Login](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-unified-login/get-started)
+- [Unified Login permissions](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-unified-login/permissions)
+- [Unified Login authentication and tokens](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-unified-login/authentication)
+- [Instagram webhook setup](https://developers.facebook.com/documentation/instagram-platform/webhooks/setup)

@@ -128,20 +128,20 @@ const INSTAGRAM_24_HOURS_MS = 24 * 60 * 60 * 1000;
 function instagramIsConfigured() {
   const key = process.env.INSTAGRAM_TOKEN_ENCRYPTION_KEY || '';
   return Boolean(process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET &&
-    process.env.INSTAGRAM_CONFIG_ID && process.env.INSTAGRAM_ACCOUNT_ID &&
+    process.env.INSTAGRAM_CONFIG_ID &&
     process.env.INSTAGRAM_REDIRECT_URI && process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN &&
     /^[a-f0-9]{64}$/i.test(key));
 }
 
 function instagramConfig() {
   if (!instagramIsConfigured()) throw new ServiceUnavailableException('Instagram sozlamalari serverda to‘liq kiritilmagan');
-  const apiVersion = process.env.INSTAGRAM_GRAPH_API_VERSION || 'v26.0';
+  const apiVersion = process.env.INSTAGRAM_GRAPH_API_VERSION || 'v27.0';
   if (!/^v\d+\.\d+$/.test(apiVersion)) throw new ServiceUnavailableException('Instagram Graph API versiyasi noto‘g‘ri');
   return {
     appId: process.env.INSTAGRAM_APP_ID!.trim(),
     appSecret: process.env.INSTAGRAM_APP_SECRET!.trim(),
     configId: process.env.INSTAGRAM_CONFIG_ID!.trim(),
-    instagramAccountId: process.env.INSTAGRAM_ACCOUNT_ID!.trim(),
+    instagramAccountId: process.env.INSTAGRAM_ACCOUNT_ID?.trim() || '',
     redirectUri: process.env.INSTAGRAM_REDIRECT_URI!.trim(),
     verifyToken: process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN!.trim(),
     encryptionKey: Buffer.from(process.env.INSTAGRAM_TOKEN_ENCRYPTION_KEY!, 'hex'),
@@ -179,7 +179,8 @@ async function instagramFetch(url: string, init: RequestInit = {}) {
   const response = await fetch(url, { ...init, signal: AbortSignal.timeout(20000) });
   const data: any = await response.json().catch(() => ({}));
   if (!response.ok || data?.error) {
-    const message = typeof data?.error?.message === 'string' ? data.error.message : 'Instagram API so‘rovi bajarilmadi';
+    const message = typeof data?.error?.message === 'string' ? data.error.message :
+      typeof data?.error_message === 'string' ? data.error_message : 'Meta API so‘rovi bajarilmadi';
     throw new Error(message.slice(0, 300));
   }
   return data;
@@ -187,16 +188,21 @@ async function instagramFetch(url: string, init: RequestInit = {}) {
 
 async function instagramAccount() {
   const result = await pool.query(
-    'SELECT id, ig_user_id, username, access_token_encrypted, token_expires_at, webhook_subscribed, connected_at FROM instagram_accounts WHERE id = $1',
+    'SELECT id, ig_user_id, username, access_token_encrypted, token_expires_at, login_type, webhook_subscribed, connected_at FROM instagram_accounts WHERE id = $1',
     [INSTAGRAM_SINGLETON_ID],
   );
   return result.rows[0] || null;
 }
 
 async function instagramAccessToken(account: any) {
+  if (account.login_type && account.login_type !== 'unified_login') {
+    throw new ServiceUnavailableException('Instagram akkauntini Meta Unified Login orqali qayta ulang.');
+  }
   const token = decryptInstagramToken(account.access_token_encrypted);
   const expiresAt = account.token_expires_at ? new Date(account.token_expires_at).getTime() : 0;
-  if (expiresAt && expiresAt <= Date.now()) throw new ServiceUnavailableException('Instagram sessiyasi tugagan. Akkauntni qayta ulang.');
+  if (expiresAt && expiresAt <= Date.now()) {
+    throw new ServiceUnavailableException('Instagram sessiyasi tugagan. Akkauntni qayta ulang.');
+  }
   return token;
 }
 
@@ -419,14 +425,20 @@ class ApiController {
   @UseGuards(AuthGuard)
   async instagramStatus() {
     const account = await instagramAccount();
+    const expiresAt = account?.token_expires_at ? new Date(account.token_expires_at).getTime() : 0;
+    const needsReconnect = Boolean(account && (account.login_type !== 'unified_login' || (expiresAt && expiresAt <= Date.now())));
+    if (account && !needsReconnect) {
+      try { await instagramAccessToken(account); } catch {}
+    }
     return {
-      connected: Boolean(account),
+      connected: Boolean(account && !needsReconnect),
       setupReady: instagramIsConfigured(),
-      username: account?.username || null,
-      igUserId: account?.ig_user_id || null,
+      needsReconnect,
+      username: account && !needsReconnect ? account.username : null,
+      igUserId: account && !needsReconnect ? account.ig_user_id : null,
       connectedAt: account?.connected_at || null,
       tokenExpiresAt: account?.token_expires_at || null,
-      webhookSubscribed: Boolean(account?.webhook_subscribed),
+      webhookSubscribed: Boolean(account?.webhook_subscribed && !needsReconnect),
     };
   }
 
@@ -441,7 +453,9 @@ class ApiController {
     url.searchParams.set('config_id', config.configId);
     url.searchParams.set('redirect_uri', config.redirectUri);
     url.searchParams.set('response_type', 'code');
+    url.searchParams.set('display', 'popup');
     url.searchParams.set('override_default_response_type', 'true');
+    url.searchParams.set('prompt', 'login');
     url.searchParams.set('state', state);
     return { url: url.toString() };
   }
@@ -465,14 +479,19 @@ class ApiController {
       tokenUrl.searchParams.set('redirect_uri', config.redirectUri);
       tokenUrl.searchParams.set('code', code);
       const tokenResult: any = await instagramFetch(tokenUrl.toString());
-      if (typeof tokenResult.access_token !== 'string') throw new Error('Meta token exchange failed');
+      if (typeof tokenResult?.access_token !== 'string') throw new Error('Meta access token exchange failed');
       const accessToken = tokenResult.access_token;
-      const profileUrl = new URL('https://graph.facebook.com/' + config.apiVersion + '/' + encodeURIComponent(config.instagramAccountId));
-      profileUrl.searchParams.set('fields', 'id,username');
-      profileUrl.searchParams.set('access_token', accessToken);
-      const profile: any = await instagramFetch(profileUrl.toString());
-      const igUserId = String(profile.id || config.instagramAccountId);
-      if (!igUserId) throw new Error('Instagram account ID was not returned');
+
+      const accountsUrl = new URL('https://graph.facebook.com/' + config.apiVersion + '/me/assigned_instagram_accounts');
+      accountsUrl.searchParams.set('fields', 'id,username');
+      accountsUrl.searchParams.set('access_token', accessToken);
+      const accountResult: any = await instagramFetch(accountsUrl.toString());
+      const instagramAccounts = Array.isArray(accountResult?.data) ? accountResult.data : [];
+      const profile = config.instagramAccountId
+        ? instagramAccounts.find((item: any) => String(item?.id || '') === config.instagramAccountId)
+        : instagramAccounts.length === 1 ? instagramAccounts[0] : null;
+      if (!profile?.id) throw new Error('The configured Instagram account was not shared with this app');
+      const igUserId = String(profile.id);
       const username = String(profile.username || 'Instagram account').slice(0, 100);
       const expiresIn = Number(tokenResult.expires_in);
       const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000) : null;
@@ -490,12 +509,12 @@ class ApiController {
       }
 
       await pool.query(
-        'INSERT INTO instagram_accounts (id, ig_user_id, username, access_token_encrypted, token_expires_at, webhook_subscribed, connected_by, connected_at) ' +
-        'VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) ' +
+        'INSERT INTO instagram_accounts (id, ig_user_id, username, access_token_encrypted, token_expires_at, login_type, webhook_subscribed, connected_by, connected_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) ' +
         'ON CONFLICT (id) DO UPDATE SET ig_user_id = EXCLUDED.ig_user_id, username = EXCLUDED.username, ' +
         'access_token_encrypted = EXCLUDED.access_token_encrypted, token_expires_at = EXCLUDED.token_expires_at, ' +
-        'webhook_subscribed = EXCLUDED.webhook_subscribed, connected_by = EXCLUDED.connected_by, connected_at = NOW()',
-        [INSTAGRAM_SINGLETON_ID, igUserId, username, encryptInstagramToken(accessToken), expiresAt, webhookSubscribed, userId],
+        'login_type = EXCLUDED.login_type, webhook_subscribed = EXCLUDED.webhook_subscribed, connected_by = EXCLUDED.connected_by, connected_at = NOW()',
+        [INSTAGRAM_SINGLETON_ID, igUserId, username, encryptInstagramToken(accessToken), expiresAt, 'unified_login', webhookSubscribed, userId],
       );
       return res.redirect(302, instagramFrontendRedirect('connected', webhookSubscribed ? '' : 'check'));
     } catch {
